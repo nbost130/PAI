@@ -6,8 +6,12 @@
  * enriches low ratings with FAILURES/ context, clusters patterns, and uses
  * Haiku inference to extract "stop doing X" / "do more of Y" recommendations.
  *
+ * High-water-mark: By default, only analyzes ratings newer than the last run.
+ * State stored in PAIUpgrade/State/mine-ratings-hwm.json.
+ *
  * Usage:
- *   bun MineRatings.ts              # Full analysis, save report
+ *   bun MineRatings.ts              # Analyze only NEW ratings since last run
+ *   bun MineRatings.ts --all        # Analyze ALL ratings (ignore high-water-mark)
  *   bun MineRatings.ts --dry-run    # Print stats only, no AI inference
  *   bun MineRatings.ts --since 7    # Only analyze last 7 days
  */
@@ -27,6 +31,8 @@ const BASE = join(HOME, '.claude');
 const RATINGS_FILE = join(BASE, 'MEMORY', 'LEARNING', 'SIGNALS', 'ratings.jsonl');
 const FAILURES_DIR = join(BASE, 'MEMORY', 'LEARNING', 'FAILURES');
 const SYNTHESIS_DIR = join(BASE, 'MEMORY', 'LEARNING', 'SYNTHESIS');
+const SCRIPT_DIR = join(BASE, 'skills', 'PAIUpgrade');
+const HWM_FILE = join(SCRIPT_DIR, 'State', 'mine-ratings-hwm.json');
 
 // ── Types ──
 
@@ -54,10 +60,35 @@ interface ClusterSummary {
   failures: FailureCapture[];
 }
 
+// ── High-Water-Mark State ──
+
+interface HWMState {
+  last_analyzed_timestamp: string;
+  last_run: string;
+  entries_analyzed: number;
+}
+
+function loadHWM(): HWMState | null {
+  if (!existsSync(HWM_FILE)) return null;
+  try {
+    return JSON.parse(readFileSync(HWM_FILE, 'utf-8')) as HWMState;
+  } catch { return null; }
+}
+
+function saveHWM(latestTimestamp: string, count: number): void {
+  const state: HWMState = {
+    last_analyzed_timestamp: latestTimestamp,
+    last_run: new Date().toISOString(),
+    entries_analyzed: count,
+  };
+  writeFileSync(HWM_FILE, JSON.stringify(state, null, 2), 'utf-8');
+}
+
 // ── Args ──
 
 const args = process.argv.slice(2);
 const DRY_RUN = args.includes('--dry-run');
+const ANALYZE_ALL = args.includes('--all');
 const sinceIdx = args.indexOf('--since');
 const SINCE_DAYS = sinceIdx >= 0 ? parseInt(args[sinceIdx + 1], 10) : 0;
 
@@ -197,6 +228,47 @@ async function extractPatterns(cluster: ClusterSummary, direction: 'stop' | 'mor
   return result.output;
 }
 
+// ── Draft Steering Rule Generation ──
+
+async function draftSteeringRules(stopPatterns: string, lowCluster: ClusterSummary): Promise<string> {
+  if (lowCluster.count === 0) return '(No low ratings — no draft rules generated)';
+
+  const failureEvidence = lowCluster.failures.length > 0
+    ? '\n\nFAILURE EVIDENCE:\n' + lowCluster.failures
+        .map(f => `- ${f.title}: ${f.content.slice(0, 300)}`)
+        .join('\n')
+    : '';
+
+  const systemPrompt = `You convert AI behavioral patterns into steering rules. Each rule follows this EXACT format:
+
+## [Rule Title in Title Case]
+
+Statement
+: [One imperative sentence describing the rule]
+
+Bad
+: [Concrete example of the wrong behavior — describe the full interaction: what user asked, what AI did wrong, what happened as a result]
+
+Correct
+: [Concrete example of the right behavior — same scenario but done correctly]
+
+Generate 2-4 rules from the patterns provided. Be extremely specific and concrete — reference real scenarios like QuickBooks API calls, OAuth tokens, MCP servers, file operations, etc. The rules should be actionable behavioral guardrails, not vague advice.`;
+
+  const userPrompt = `PATTERNS TO CONVERT:\n\n${stopPatterns}${failureEvidence}`;
+
+  const result = await inference({
+    systemPrompt,
+    userPrompt,
+    level: 'fast',
+    timeout: 45000,
+  });
+
+  if (!result.success) {
+    return `(Draft rule generation failed: ${result.error})`;
+  }
+  return result.output;
+}
+
 // ── Report Generation ──
 
 function formatDistribution(dist: Record<number, number>, total: number): string {
@@ -221,12 +293,27 @@ async function main() {
   // Load data
   let entries = loadRatings();
   const failures = loadFailures();
+  const hwm = loadHWM();
+  let freshOnly = false;
 
-  // Apply time filter
+  // Apply filters in priority order: --since > --all > high-water-mark
   if (SINCE_DAYS > 0) {
     const cutoff = new Date(Date.now() - SINCE_DAYS * 24 * 60 * 60 * 1000);
     entries = entries.filter(e => new Date(e.timestamp) >= cutoff);
     console.log(`Filtered to last ${SINCE_DAYS} days: ${entries.length} entries\n`);
+  } else if (!ANALYZE_ALL && hwm) {
+    const cutoff = new Date(hwm.last_analyzed_timestamp);
+    const before = entries.length;
+    entries = entries.filter(e => new Date(e.timestamp) > cutoff);
+    freshOnly = true;
+    console.log(`High-water-mark: last run ${hwm.last_run.split('T')[0]} (analyzed ${hwm.entries_analyzed} entries)`);
+    console.log(`Fresh ratings since: ${hwm.last_analyzed_timestamp.split('T')[0]} → ${entries.length} new (of ${before} total)\n`);
+    if (entries.length === 0) {
+      console.log('No new ratings since last analysis. Use --all to reprocess everything.');
+      process.exit(0);
+    }
+  } else if (ANALYZE_ALL) {
+    console.log(`--all: Analyzing all ${entries.length} ratings (ignoring high-water-mark)\n`);
   }
 
   if (entries.length === 0) {
@@ -280,16 +367,26 @@ async function main() {
     morePatterns = await extractPatterns(highCluster, 'more');
   }
 
+  // Generate draft steering rules from "stop" patterns
+  let draftRules = '(No patterns to convert to rules)';
+  if (lowCluster.count > 0 && stopPatterns !== '(No low ratings to analyze)') {
+    console.log('Generating draft steering rules...');
+    draftRules = await draftSteeringRules(stopPatterns, lowCluster);
+  }
+
   // Build report
   const now = new Date();
   const dateStr = now.toISOString().split('T')[0];
   const yearMonth = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
+
+  const scopeLabel = freshOnly ? 'incremental (new only)' : ANALYZE_ALL ? 'full (--all)' : 'full (first run)';
 
   const report = `# Ratings Analysis Report
 
 **Generated:** ${now.toISOString()}
 **Period:** ${stats.earliest} to ${stats.latest}
 **Entries analyzed:** ${stats.total}
+**Scope:** ${scopeLabel}
 **Failure captures reviewed:** ${failures.length}
 
 ## Overview
@@ -323,6 +420,10 @@ ${stats.low.slice(0, 20).map(e => `- **[${e.rating}]** ${e.timestamp.split('T')[
 
 ${stats.high.filter(e => e.rating >= 8).slice(0, 20).map(e => `- **[${e.rating}]** ${e.timestamp.split('T')[0]} — ${e.sentiment_summary || e.comment || '(no context)'}`).join('\n')}
 
+## Draft Steering Rules (auto-generated — review before adding to USER/AISTEERINGRULES.md)
+
+${draftRules}
+
 ## Failure Capture Titles (${failures.length} total)
 
 ${failures.map(f => `- ${f.title}`).join('\n') || '(none)'}
@@ -337,10 +438,18 @@ ${failures.map(f => `- ${f.title}`).join('\n') || '(none)'}
   const reportPath = join(synthDir, `ratings-analysis-${dateStr}.md`);
   writeFileSync(reportPath, report, 'utf-8');
 
+  // Update high-water-mark with latest timestamp from analyzed entries
+  const sortedByTime = [...entries].sort((a, b) =>
+    new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime()
+  );
+  const latestTimestamp = sortedByTime[0]?.timestamp || new Date().toISOString();
+  saveHWM(latestTimestamp, entries.length);
+
   console.log(`\n${'='.repeat(60)}`);
   console.log(report);
   console.log(`${'='.repeat(60)}`);
   console.log(`\nReport saved to: ${reportPath}`);
+  console.log(`High-water-mark updated: ${latestTimestamp}`);
 }
 
 main().catch(err => {
