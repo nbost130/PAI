@@ -337,9 +337,13 @@ COUNTSEOF
     [ -f "$USAGE_CACHE" ] && cache_age=$(($(date +%s) - $(get_mtime "$USAGE_CACHE")))
 
     if [ "$cache_age" -gt "$USAGE_CACHE_TTL" ]; then
-        # Extract OAuth token from macOS Keychain
-        keychain_data=$(security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null)
-        token=$(echo "$keychain_data" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('claudeAiOauth',{}).get('accessToken',''))" 2>/dev/null)
+        # Extract OAuth token — macOS Keychain or Linux credentials file
+        if [ "$(uname -s)" = "Darwin" ]; then
+            cred_json=$(security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null)
+        else
+            cred_json=$(cat "${HOME}/.claude/.credentials.json" 2>/dev/null)
+        fi
+        token=$(echo "$cred_json" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('claudeAiOauth',{}).get('accessToken',''))" 2>/dev/null)
 
         if [ -n "$token" ]; then
             usage_json=$(curl -s --max-time 3 \
@@ -790,7 +794,7 @@ case "$MODE" in
             local_right_len=${#session_display}
             local_fill=$((72 - local_left_len - local_right_len))
             [ "$local_fill" -lt 2 ] && local_fill=2
-            local_dashes=$(printf '%*s' "$local_fill" '' | tr ' ' '─')
+            local_dashes=$(printf '%*s' "$local_fill" '' | sed 's/ /─/g')
             printf "${SLATE_600}── │${RESET} ${PAI_P}P${PAI_A}A${PAI_I}I${RESET} ${PAI_A}STATUSLINE${RESET} ${SLATE_600}│ ${local_dashes}${RESET} ${PAI_SESSION}${session_display}${RESET}\n"
         else
             printf "${SLATE_600}── │${RESET} ${PAI_P}P${PAI_A}A${PAI_I}I${RESET} ${PAI_A}STATUSLINE${RESET} ${SLATE_600}│ ──────────────────${RESET}\n"
@@ -806,7 +810,7 @@ case "$MODE" in
             local_right_len=${#session_display}
             local_fill=$((72 - local_left_len - local_right_len))
             [ "$local_fill" -lt 2 ] && local_fill=2
-            local_dashes=$(printf '%*s' "$local_fill" '' | tr ' ' '─')
+            local_dashes=$(printf '%*s' "$local_fill" '' | sed 's/ /─/g')
             printf "${SLATE_600}── │${RESET} ${PAI_P}P${PAI_A}A${PAI_I}I${RESET} ${PAI_A}STATUSLINE${RESET} ${SLATE_600}│ ${local_dashes}${RESET} ${PAI_SESSION}${session_display}${RESET}\n"
         else
             printf "${SLATE_600}── │${RESET} ${PAI_P}P${PAI_A}A${PAI_I}I${RESET} ${PAI_A}STATUSLINE${RESET} ${SLATE_600}│ ────────────────────────────────────────${RESET}\n"
@@ -822,7 +826,7 @@ case "$MODE" in
             local_right_len=${#session_display}
             local_fill=$((72 - local_left_len - local_right_len))
             [ "$local_fill" -lt 2 ] && local_fill=2
-            local_dashes=$(printf '%*s' "$local_fill" '' | tr ' ' '─')
+            local_dashes=$(printf '%*s' "$local_fill" '' | sed 's/ /─/g')
             printf "${SLATE_600}── │${RESET} ${PAI_P}P${PAI_A}A${PAI_I}I${RESET} ${PAI_A}STATUSLINE${RESET} ${SLATE_600}│ ${local_dashes}${RESET} ${PAI_SESSION}${session_display}${RESET}\n"
         else
             printf "${SLATE_600}── │${RESET} ${PAI_P}P${PAI_A}A${PAI_I}I${RESET} ${PAI_A}STATUSLINE${RESET} ${SLATE_600}│ ──────────────────────────────────────────────────${RESET}\n"

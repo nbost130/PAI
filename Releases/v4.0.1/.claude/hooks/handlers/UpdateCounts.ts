@@ -172,13 +172,19 @@ async function refreshUsageCache(paiDir: string): Promise<void> {
   const usageCachePath = join(paiDir, 'MEMORY/STATE/usage-cache.json');
 
   try {
-    // Extract OAuth token from macOS Keychain
-    const keychainData = execSync(
-      'security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null',
-      { encoding: 'utf-8', timeout: 3000 }
-    ).trim();
+    // Extract OAuth token — macOS Keychain or Linux credentials file
+    let credJson: string;
+    if (process.platform === 'darwin') {
+      credJson = execSync(
+        'security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null',
+        { encoding: 'utf-8', timeout: 3000 }
+      ).trim();
+    } else {
+      const credPath = join(process.env.HOME || '', '.claude', '.credentials.json');
+      credJson = readFileSync(credPath, 'utf-8').trim();
+    }
 
-    const parsed = JSON.parse(keychainData);
+    const parsed = JSON.parse(credJson);
     const token = parsed?.claudeAiOauth?.accessToken;
     if (!token) return;
 
